@@ -1008,8 +1008,9 @@ impl FontStyleCache {
 /// name-based bold/italic heuristics.
 ///
 /// Italic: `ItalicAngle` beyond a few degrees, or Flags bit 7 (Italic,
-/// value 64). Bold: Flags bit 19 (ForceBold, value 1<<18). The small
-/// ItalicAngle threshold skips fonts that declare a token slant.
+/// value 64). Bold: Flags bit 19 (ForceBold, value 1<<18) or `FontWeight`
+/// at semibold and above. The small ItalicAngle threshold skips fonts that
+/// declare a token slant.
 pub(crate) fn descriptor_style_flags(
     doc: &Document,
     font_dict: &lopdf::Dictionary,
@@ -1044,9 +1045,22 @@ pub(crate) fn descriptor_style_flags(
         .ok()
         .and_then(|obj| obj.as_i64().ok())
         .unwrap_or(0);
+    // Type3 fonts (Chrome/Skia HTML prints) carry no FontFile, and their
+    // BaseFont names are actively misleading — the bold face is emitted as
+    // "BAAAAA+.SFNS-Regular_...wght2580000". FontWeight is then the only
+    // honest signal; 600 is semibold in the PDF spec's 100..900 scale.
+    let font_weight = descriptor
+        .get(b"FontWeight")
+        .ok()
+        .and_then(|obj| match obj {
+            Object::Integer(i) => Some(*i as f32),
+            Object::Real(r) => Some(*r),
+            _ => None,
+        })
+        .unwrap_or(0.0);
 
     let mut italic = italic_angle.abs() >= 4.0 || flags & (1 << 6) != 0;
-    let mut bold = flags & (1 << 18) != 0;
+    let mut bold = flags & (1 << 18) != 0 || font_weight >= 600.0;
 
     // Descriptors lie: subset generators write ItalicAngle 0 for genuinely
     // italic faces. The embedded font file keeps the truth — OS/2
@@ -1870,6 +1884,57 @@ mod tests {
         assert_eq!(
             descriptor_style_flags(&doc, &font_dict, &mut FontStyleCache::new()),
             (false, true)
+        );
+    }
+
+    #[test]
+    fn descriptor_font_weight_sets_bold() {
+        // Chrome/Skia HTML prints emit Type3 fonts: no FontFile to inspect,
+        // ForceBold unset, and a BaseFont name that says "Regular" for the
+        // bold face. FontWeight is the only signal left.
+        let (doc, font_dict) = doc_with_descriptor(dictionary! {
+            "Type" => "FontDescriptor",
+            "FontName" => "BAAAAA+.SFNS-Regular_wdth_opsz180000_GRAD_wght2580000",
+            "ItalicAngle" => 0,
+            "Flags" => 4,
+            "FontWeight" => 600,
+        });
+        assert_eq!(
+            descriptor_style_flags(&doc, &font_dict, &mut FontStyleCache::new()),
+            (false, true)
+        );
+    }
+
+    #[test]
+    fn descriptor_regular_font_weight_is_not_bold() {
+        let (doc, font_dict) = doc_with_descriptor(dictionary! {
+            "Type" => "FontDescriptor",
+            "FontName" => "CAAAAA+.SFNS-Regular",
+            "ItalicAngle" => 0,
+            "Flags" => 12,
+            "FontWeight" => 400,
+        });
+        assert_eq!(
+            descriptor_style_flags(&doc, &font_dict, &mut FontStyleCache::new()),
+            (false, false)
+        );
+    }
+
+    #[test]
+    fn descriptor_medium_font_weight_is_not_bold() {
+        // 500 is medium — visually close to regular. Only 600 (semibold) and
+        // above should read as bold, or body text in medium-weight themes
+        // would be emphasised wholesale.
+        let (doc, font_dict) = doc_with_descriptor(dictionary! {
+            "Type" => "FontDescriptor",
+            "FontName" => "Tc1",
+            "ItalicAngle" => 0,
+            "Flags" => 4,
+            "FontWeight" => 500,
+        });
+        assert_eq!(
+            descriptor_style_flags(&doc, &font_dict, &mut FontStyleCache::new()),
+            (false, false)
         );
     }
 
