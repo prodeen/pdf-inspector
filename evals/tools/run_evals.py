@@ -117,17 +117,21 @@ def main() -> int:
     # `valued%` — not `exact%` — is the column to read. It counts only golden
     # rows that carry at least one value, so a document that lost every number
     # cannot post a respectable score off rows that never had one.
-    hdr = f"{'document':<30}{'pages':>6}{'chars%':>8}{'textsim':>9}{'keys':>6}{'valued%':>8}"
+    # `words%` is the only column that sees lost inter-word spacing; chars% and
+    # textsim both normalise whitespace away and rate such a document healthy.
+    hdr = (f"{'document':<30}{'pages':>6}{'chars%':>8}{'words%':>8}{'textsim':>9}"
+           f"{'keys':>6}{'valued%':>8}")
     print(hdr)
     print("-" * len(hdr))
     for r in results:
         if r.get("classification_only"):
-            print(f"{r['id']:<30}{'—':>6}{'—':>8}{'—':>9}{'—':>6}"
+            print(f"{r['id']:<30}{'—':>6}{'—':>8}{'—':>8}{'—':>9}{'—':>6}"
                   f"{'  (classification only)':>8}")
             continue
         keys = r.get("valued_keys", 0)
         valued = r.get("valued_keys_exact_pct")
         print(f"{r['id']:<30}{r['golden_pages']:>6}{r['raw_chars_retained_pct']:>8.1f}"
+              f"{r['word_boundary_retained_pct']:>8.1f}"
               f"{r['text_similarity']:>9.4f}{keys:>6}"
               f"{('—' if valued is None else f'{valued:.1f}'):>8}")
 

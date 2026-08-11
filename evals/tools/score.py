@@ -145,6 +145,16 @@ def main() -> int:
     gn, cn = re.sub(r"\s+", "", gold_text), re.sub(r"\s+", "", cand_text)
     chars_pct = 100 * len(cn) / max(len(gn), 1)
 
+    # Both metrics above normalise whitespace away, so a document that lost
+    # every inter-word space scores as healthy on both: al-ligj-103-2016 fuses
+    # whole lines into single tokens and still posts 100% chars and 0.90
+    # similarity. Word counts are the only view that sees it — that document
+    # keeps 745 of its 2510 words, and 135 of its tokens run past 25 chars.
+    gold_words = len(re.findall(r"\S+", gold_text))
+    cand_words = len(re.findall(r"\S+", cand_text))
+    words_pct = 100 * cand_words / max(gold_words, 1)
+    fused = sum(1 for t in re.findall(r"\S+", cand_text) if len(t) > 25)
+
     print("-" * sum(widths))
     summary = {
         "golden_pages": len(golden_files),
@@ -152,6 +162,8 @@ def main() -> int:
         "candidate_table_blocks": len(cand_tables),
         "text_similarity": round(sim, 4),
         "raw_chars_retained_pct": round(chars_pct, 1),
+        "word_boundary_retained_pct": round(words_pct, 1),
+        "fused_tokens": fused,
         "per_page": per_page,
     }
     print(f"golden pages              : {len(golden_files)}")
@@ -159,6 +171,7 @@ def main() -> int:
     print(f"candidate table blocks    : {len(cand_tables)}")
     print(f"raw chars retained        : {chars_pct:.1f}%")
     print(f"text similarity           : {sim:.4f}")
+    print(f"word boundaries retained  : {words_pct:.1f}%  ({fused} tokens >25 chars)")
 
     if key_re:
         pct_found = 100 * tot_found / max(tot_keys, 1)
