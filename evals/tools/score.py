@@ -46,12 +46,22 @@ def tables(md: str) -> list[list[list[str]]]:
 
 
 def keyed_rows(md: str, key_re: re.Pattern) -> dict[str, tuple[str, ...]]:
-    """Map row key -> trailing cells, for rows whose first cell matches the key."""
+    """Map row key -> trailing cells, for rows whose first cell matches the key.
+
+    Trailing empty cells are dropped. An extractor that emits a phantom empty
+    column pads every row with `""`, which would fail an exact tuple comparison
+    on rows whose values are all correct and correctly attributed — reporting
+    it as the dissociation failure this metric exists to detect. Padding is a
+    formatting defect; it belongs in the structure metrics, not this one.
+    """
     found: dict[str, tuple[str, ...]] = {}
     for t in tables(md):
         for row in t:
             if row and key_re.match(row[0]):
-                found[row[0]] = tuple(row[1:])
+                values = list(row[1:])
+                while values and not values[-1]:
+                    values.pop()
+                found[row[0]] = tuple(values)
     return found
 
 
@@ -94,6 +104,11 @@ def main() -> int:
 
     per_page = []
     tot_keys = tot_found = tot_exact = tot_rows = 0
+    # A golden row whose only cell is its own label carries no payload, so
+    # reproducing it proves nothing. Counting those rows as successes is how a
+    # document that lost every residue value can still post a respectable
+    # exact-match rate. `valued` counts only rows that have something to lose.
+    tot_valued = tot_valued_exact = 0
     for gf in golden_files:
         g = gf.read_text()
         gt = tables(g)
@@ -107,15 +122,26 @@ def main() -> int:
             gk = keyed_rows(g, key_re)
             found = sum(1 for k in gk if k in cand_keys)
             exact = sum(1 for k, v in gk.items() if cand_keys.get(k) == v)
+            valued = {k: v for k, v in gk.items() if any(c for c in v[1:])}
+            valued_exact = sum(1 for k, v in valued.items() if cand_keys.get(k) == v)
             tot_keys += len(gk); tot_found += found; tot_exact += exact
-            rec |= {"keys": len(gk), "found": found, "exact": exact}
+            tot_valued += len(valued); tot_valued_exact += valued_exact
+            rec |= {"keys": len(gk), "found": found, "exact": exact,
+                    "valued": len(valued), "valued_exact": valued_exact}
             cells += [str(len(gk)).rjust(widths[3]), str(found).rjust(widths[4]),
                       str(exact).rjust(widths[5])]
         per_page.append(rec)
         print("".join(cells))
 
     gold_text = "\n".join(f.read_text() for f in golden_files)
-    sim = difflib.SequenceMatcher(None, _norm(cand_text), _norm(gold_text)).ratio()
+    # autojunk=False is load-bearing. difflib's autojunk heuristic treats any
+    # element occurring in more than 1% of a sequence longer than 200 as junk —
+    # on a *character* sequence that is most of the alphabet, so it silently
+    # collapses the ratio on longer documents. The SDS excerpt scores 0.2317
+    # with it on and 0.9069 with it off, for the same pair of files.
+    sim = difflib.SequenceMatcher(
+        None, _norm(cand_text), _norm(gold_text), autojunk=False
+    ).ratio()
     gn, cn = re.sub(r"\s+", "", gold_text), re.sub(r"\s+", "", cand_text)
     chars_pct = 100 * len(cn) / max(len(gn), 1)
 
@@ -137,14 +163,20 @@ def main() -> int:
     if key_re:
         pct_found = 100 * tot_found / max(tot_keys, 1)
         pct_exact = 100 * tot_exact / max(tot_keys, 1)
+        pct_valued = 100 * tot_valued_exact / max(tot_valued, 1)
         summary |= {"keys_in_golden": tot_keys, "keys_found": tot_found,
                     "keys_exact": tot_exact, "keys_found_pct": round(pct_found, 1),
-                    "keys_exact_pct": round(pct_exact, 1)}
+                    "keys_exact_pct": round(pct_exact, 1),
+                    "valued_keys": tot_valued, "valued_keys_exact": tot_valued_exact,
+                    "valued_keys_exact_pct": round(pct_valued, 1)}
         print()
         print(f"row keys in golden        : {tot_keys}")
         print(f"  present in candidate    : {tot_found}  ({pct_found:.1f}%)")
-        print(f"  with ALL values correct : {tot_exact}  ({pct_exact:.1f}%)  <- decides usability")
-        if pct_exact < 50 and chars_pct > 80:
+        print(f"  with ALL values correct : {tot_exact}  ({pct_exact:.1f}%)")
+        print(f"row keys carrying values  : {tot_valued}")
+        print(f"  with ALL values correct : {tot_valued_exact}  ({pct_valued:.1f}%)"
+              f"  <- decides usability")
+        if pct_valued < 50 and chars_pct > 80:
             print()
             print("  WARNING: high character retention with low key integrity means values")
             print("  are DISSOCIATED, not missing. Text metrics will look healthy and the")
