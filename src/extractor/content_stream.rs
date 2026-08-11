@@ -22,11 +22,33 @@ use super::underline::UnderlineLine;
 use super::xobjects::{extract_form_xobject_text, get_page_xobjects, FormWalkBudget, XObjectType};
 use super::{get_number, image_bbox_from_ctm, multiply_matrices};
 
+/// True when `data[i..]` starts with `tok` as a standalone operator: preceded
+/// by whitespace (or start of stream) and followed by whitespace, a delimiter,
+/// or end of stream. `/ID` — a name, not the inline-image operator — fails the
+/// preceding-byte test because `/` is not whitespace.
+fn is_operator_at(data: &[u8], i: usize, tok: &[u8]) -> bool {
+    if !data[i..].starts_with(tok) {
+        return false;
+    }
+    let before_ok = i == 0 || data[i - 1].is_ascii_whitespace() || data[i - 1] == 0;
+    let after_ok = match data.get(i + tok.len()) {
+        None => true,
+        Some(&c) => c.is_ascii_whitespace() || b"()<>[]{}/%".contains(&c),
+    };
+    before_ok && after_ok
+}
+
 /// Strip PDF comments (% to end of line) from content stream bytes.
 ///
 /// Some PDF generators (e.g. PD4ML) embed comments in content streams that
 /// confuse lopdf's `Content::decode` parser.  Comments inside string literals
 /// (parentheses) are NOT stripped — only top-level comments.
+///
+/// Inline images (`BI … ID <binary> EI`) are copied verbatim. Their payload is
+/// raw pixel data in which `%` is an ordinary byte, and treating one as a
+/// comment deletes bytes up to the next newline — which can swallow the `EI`
+/// terminator and make the whole stream unparseable. Acrobat writes ruled
+/// table borders as one-pixel-tall inline images, so this is not a rare shape.
 fn strip_pdf_comments(data: &[u8]) -> Vec<u8> {
     // Quick check: if no '%' present, return as-is (common case)
     if !data.contains(&b'%') {
@@ -37,9 +59,36 @@ fn strip_pdf_comments(data: &[u8]) -> Vec<u8> {
     let mut i = 0;
     let mut in_string = 0i32; // parenthesis nesting depth
     let mut in_hex_string = false;
+    // Set by `BI`, cleared by `EI`; `ID` only opens image data while set, so a
+    // stray `ID` token in ordinary content cannot swallow the rest of a page.
+    let mut in_inline_image = false;
 
     while i < data.len() {
         let b = data[i];
+        if in_string == 0 && !in_hex_string {
+            if !in_inline_image && is_operator_at(data, i, b"BI") {
+                in_inline_image = true;
+            } else if in_inline_image && is_operator_at(data, i, b"ID") {
+                // Copy `ID`, the single whitespace byte that follows it, and
+                // every byte of image data up to the `EI` terminator.
+                result.extend_from_slice(b"ID");
+                i += 2;
+                if let Some(&ws) = data.get(i) {
+                    result.push(ws);
+                    i += 1;
+                }
+                while i < data.len() && !is_operator_at(data, i, b"EI") {
+                    result.push(data[i]);
+                    i += 1;
+                }
+                in_inline_image = false;
+                continue;
+            } else if in_inline_image && is_operator_at(data, i, b"EI") {
+                // Malformed: `EI` without an `ID`. Leave image mode so a later
+                // comment is still stripped.
+                in_inline_image = false;
+            }
+        }
         match b {
             // Inside a string literal, a backslash escapes the next byte —
             // `\(`, `\)`, and `\\` must not touch the nesting depth, or a
@@ -2158,6 +2207,45 @@ end"#;
             output_str.contains("ET"),
             "ET should be preserved after comment stripping"
         );
+    }
+
+    /// Acrobat draws ruled borders as one-pixel-tall inline images. Their raw
+    /// pixel data contains `%` bytes; stripping from one to the next newline
+    /// eats the `EI` terminator, `Content::decode` then rejects the whole
+    /// stream, and a single such page fails extraction of the entire document.
+    #[test]
+    fn test_strip_pdf_comments_preserves_inline_image_data() {
+        // `%%` inside the pixel payload, immediately before the terminator.
+        let mut input: Vec<u8> =
+            b"q\n2 0 0 1 0 0 cm\nBI\n/W 2\n/H 1\n/BPC 8\n/CS /RGB\nID ".to_vec();
+        input.extend_from_slice(&[0xff, b'%', b'%', 0x00, 0xff, 0x00]);
+        input.extend_from_slice(b"\nEI Q\n% real comment\nBT\n");
+        let output = strip_pdf_comments(&input);
+
+        let mut expected: Vec<u8> =
+            b"q\n2 0 0 1 0 0 cm\nBI\n/W 2\n/H 1\n/BPC 8\n/CS /RGB\nID ".to_vec();
+        expected.extend_from_slice(&[0xff, b'%', b'%', 0x00, 0xff, 0x00]);
+        expected.extend_from_slice(b"\nEI Q\n \nBT\n");
+        assert_eq!(output, expected);
+
+        // Payload with no newline after the `%`: the pre-fix stripper deleted
+        // everything to end of stream, terminator included.
+        let mut input: Vec<u8> = b"BI\n/W 1\n/H 1\n/BPC 8\n/CS /G\nID ".to_vec();
+        input.extend_from_slice(&[b'%', 0x41, 0x42]);
+        input.extend_from_slice(b" EI\nQ\n");
+        let output = strip_pdf_comments(&input);
+        assert_eq!(output, input);
+
+        // A comment inside the inline-image *dictionary* is still a comment.
+        let input = b"BI\n% params follow\n/W 1\nID \x41\nEI\n";
+        let output = strip_pdf_comments(input);
+        assert_eq!(output, b"BI\n \n/W 1\nID \x41\nEI\n".to_vec());
+
+        // `/ID` is a name, not the inline-image operator, and must not put the
+        // stripper into image mode.
+        let input = b"BI\n/ID 3\n/W 1\nID \x41\nEI\n% c\nBT\n";
+        let output = strip_pdf_comments(input);
+        assert_eq!(output, b"BI\n/ID 3\n/W 1\nID \x41\nEI\n \nBT\n".to_vec());
     }
 
     #[test]
