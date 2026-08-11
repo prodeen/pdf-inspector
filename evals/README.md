@@ -140,26 +140,55 @@ of the datasource buckets:
 Both carry `in_golden_set` / `golden_doc_id` / `notes`, so promoting a document
 into `manifest.jsonl` is recorded in one place.
 
-### The pool is much smaller than 574
+### The roadmap: what is actually left
 
-Deduplicated by sha256 the 574 PDFs are **354** distinct files, and **185 of
-those 354 are 13-page `pdf-lib` slices of one document** — EU 396/2005 at
-consolidation 065.001, chunked by the ingestion pipeline. They are already
-represented by `eurlex-396-consolidated` (067.001) and are not worth further
-corpus slots; they do independently reproduce its table-collapse defect.
+```bash
+python3 evals/tools/build_roadmap.py     # ~20s cold, seconds warm
+head -20 evals/corpus-roadmap.csv
+```
 
-That leaves ~169 genuinely distinct documents. Profiling all 574 with
-`detect-pdf --analyze` takes about 9 seconds:
+Do not survey the mirror by hand. `corpus-roadmap.csv` is the candidate pool
+with everything already covered removed, one row per remaining cluster, biggest
+first — the top of the file is the answer to "what next", and `cluster_size`
+says how many files one golden retires.
 
 | | count |
 |---|---|
-| text-based | 549 |
-| image-based / scanned / mixed | 23 |
-| failed to parse at all | 2 (same file twice — now fixed) |
-| ≤20 pages | 462 |
+| mirrored PDF rows | 574 |
+| byte-identical duplicates | −220 |
+| unique files | 354 |
+| EU 396/2005 page slices (`pdf-lib`) | −185 |
+| goldened, plus template siblings | −14 |
+| **remaining** | **116 clusters / 155 files** |
 
-The ≤20-page majority is what makes self-authored goldens practical; see
-"Adding a document".
+The 185 slices are one document — EU 396/2005 at consolidation 065.001, chunked
+by the ingestion pipeline — already represented by `eurlex-396-consolidated`
+(067.001). They independently reproduce its table-collapse defect.
+
+Coverage is decided by **shape, not words**, and that distinction is load-bearing.
+Four PyFPDF product data sheets in the mirror share a template and score
+0.12–0.16 Jaccard on their text, because they describe different products: text
+similarity calls them unrelated. On block profile — headings by level, table rows
+by column count, list items, paragraphs, every word discarded — they score
+0.90–0.93, and 0.32 against the other PyFPDF template. What decides whether a
+file can teach the extractor something new is its producer and its layout, not
+its subject.
+
+Clustering only merges within a shared producer, size class and dominant script.
+The script guard matters: two all-prose documents have near-identical block
+profiles in any language, and a Cyrillic regulation exercises code a Latin one
+does not. Every member sha256 stays in the roadmap row, so collapsing loses
+nothing and is reversible.
+
+`source-documents.csv` carries the verdict per file: `in_golden_set` is `yes`
+(this file is goldened), `covered` (a sibling is), or `no`.
+
+What remains is thinner than 155 files suggests. The largest untouched clusters
+are a 15-file PyFPDF ingredient-spec template, 5 Trinidad gazette scans from
+Acrobat Paper Capture, and 5 ReportLab raw-material specs. The genuinely
+uncovered *classes* are Cyrillic (Serbian iText, ~11 files), Albanian official
+journals, Vietnamese, and the large QuarkXPress Trinidad legal codes — perhaps
+15–20 documents before the corpus stops learning anything new.
 
 Mirror the originals with `gcloud storage rsync` (not a web scraper — these are
 the exact bytes we ingested, with no dead links):

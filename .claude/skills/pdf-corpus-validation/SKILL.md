@@ -46,6 +46,13 @@ Everything lives in this repo: the corpus and pipeline in `evals/` (see
 `evals/README.md`), this skill in `.claude/skills/`. Run the whole suite with
 `python3 evals/tools/run_evals.py`.
 
+| file | what it is |
+|---|---|
+| `evals/manifest.jsonl` | the corpus + the defect inventory |
+| `evals/corpus-roadmap.csv` | **what is left to do**, covered documents removed |
+| `evals/source-documents.csv` | every mirrored file, with its coverage status |
+| `evals/golden/`, `evals/pdfs/` | the durable artifacts |
+
 Do intermediate work in a scratch directory. `.gitignore` drops `*.pdf` outside
 `tests/fixtures/` and `evals/pdfs/`, and drops any directory named `scripts/` at
 any depth — which is why the helpers are in `evals/tools/`, not `evals/scripts/`.
@@ -53,6 +60,36 @@ After adding corpus files, confirm with `git status --untracked-files=all` that
 git can actually see them.
 
 ## Workflow
+
+### 0. Pick from the roadmap — never survey the mirror by hand
+
+```bash
+python3 evals/tools/build_roadmap.py     # ~20s cold, seconds warm
+head -20 evals/corpus-roadmap.csv
+```
+
+`corpus-roadmap.csv` is the candidate pool with everything already covered
+removed: byte duplicates, files already in `manifest.jsonl`, files sharing a
+template with one, and page slices of a document the corpus already holds. One
+row per remaining cluster, biggest cluster first, so the top of the file is the
+answer to "what should I do next". `cluster_size` tells you how many files one
+golden retires.
+
+The mirror is far smaller than its file count: 574 rows are 354 unique files,
+185 of which are page slices of one regulation. Re-deriving that by hand every
+session is the single biggest waste in this workflow — it is what this file
+exists to stop.
+
+Coverage is by *shape*, not by words. Four PyFPDF product data sheets share a
+template and score 0.12–0.16 Jaccard on text because they describe different
+products; text similarity calls them unrelated. What decides whether a file can
+teach the extractor anything new is its producer and its block profile, so that
+is what clusters. Clustering is confined to a shared producer, size class and
+script — a Cyrillic regulation exercises code a Latin one does not.
+
+Prefer the top of the roadmap, but override it when a lower row covers a defect
+class the corpus has no reach into at all. Coverage of *producers and layouts*
+is the goal; document count is not.
 
 ### 1. Profile the document
 
@@ -145,9 +182,36 @@ severity, evidence and which metric each affects. The manifest doubles as the
 defect inventory — it is the thing that makes this repeatable rather than a
 one-off investigation.
 
-Goldens are unreviewed by default. Gemini hallucinates cells in dense tables.
+Set `source.source_sha256` to the sha256 of the **original mirror file**, not of
+the excerpt. That field is the join key that retires the document from the
+roadmap; without it the next session re-discovers and re-reads the file you just
+spent an hour on.
+
+Also worth carrying: `expect` (`pdf_type`, `exit_code`) for anything scoring
+cannot see, and `scoring: "classification_only"` for documents with no text
+layer, where a text golden could only ever read 0% and would look like a
+permanent regression.
+
+Goldens are unreviewed by default. Gemini hallucinates cells in dense tables,
+and a model transcribing 50 pages of renders will drop a cell somewhere.
 Spot-check a few against the page images before trusting an aggregate, and set
 `human_reviewed` honestly.
+
+### 7. Retire what you covered
+
+```bash
+python3 evals/tools/build_roadmap.py
+python3 evals/tools/run_evals.py
+git status --untracked-files=all      # `scripts/` is gitignored at any depth
+```
+
+Re-running the roadmap after the manifest is updated is what makes the next
+session cheap: the documents you just goldened drop out, and so does every file
+sharing their template. Commit `corpus-roadmap.csv` and the `source-documents.csv`
+diff alongside the goldens — the shrinking pool is part of the deliverable.
+
+Skipping this is silently expensive. It costs nothing now and costs the next
+session a full re-survey of the mirror.
 
 ## Fixing a defect
 
