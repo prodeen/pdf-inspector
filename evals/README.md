@@ -28,29 +28,76 @@ structural failure that all 966 tests pass straight through.
 cargo build --release
 python3 evals/tools/run_evals.py                        # whole corpus
 python3 evals/tools/run_evals.py --doc <id> --keep      # one doc, keep output
+python3 -m unittest discover -s evals/tools/tests       # tests for the tools
 ```
 
 Candidate markdown is regenerated each run into `evals/candidate/` and is
 gitignored. The PDFs and goldens are the durable artifacts. Exit code is
 nonzero if a document falls below its manifest `gate`.
 
+The tools' own tests live in `evals/tools/tests/`, not `scripts/tests/`,
+because `.gitignore` drops any directory named `scripts/` at any depth — a new
+file added there is invisible to git and silently never committed. After adding
+anything under `evals/`, confirm with `git status --untracked-files=all`.
+
 ## Current state
 
-| document | pages | chars retained | text sim | row keys | keys with correct values |
-|---|---|---|---|---|---|
-| `melatonin-eu-permissibility` | 2 | 91.4% | 0.9502 | — | — |
-| `eurlex-396-consolidated` | 15 | 90.0% | 0.3857 | 229 | **0 (0.0%)** |
+12 documents, 55 pages of golden reference, 11 PDF producers.
 
-Read that second row carefully, because it is the reason this corpus exists.
-On EU 396/2005 the extractor retains 90% of characters and **100% of the 202
-numeric residue values**, while **zero** of 229 commodity codes still carry
-their correct values. The data is not missing — it is *dissociated*. Every MRL
-number is present; none is attributable to its commodity.
+| document | pages | chars | text sim | valued keys | correct |
+|---|---|---|---|---|---|
+| `codex-gsfa-cxs192` | 3 | 100.4% | 0.9944 | 105 | 97.1% |
+| `sg-food-additives-permitted` | 3 | 99.9% | 0.9973 | 51 | 76.5% |
+| `pyfpdf-sea-salt-spec` | 2 | 100.6% | 0.9970 | — | — |
+| `anvisa-rdc-tables` | 3 | 103.3% | 0.9655 | — | — |
+| `tt-legal-notice-192-1999` | 4 | 100.8% | 0.9631 | — | — |
+| `melatonin-eu-permissibility` | 2 | 91.4% | 0.9530 | — | — |
+| `citric-acid-coa-sds` | 4 | 97.4% | 0.9069 | — | — |
+| `tw-food-additive-standards` | 3 | 101.5% | 0.8719 | 8 | 12.5% |
+| `ara-oil-supply-chain-dashboard` | 6 | 101.2% | 0.8663 | — | — |
+| `eurlex-396-consolidated` | 15 | 90.0% | 0.5522 | 116 | **0.0%** |
+| `jp-additive-use-categories` | 3 | **47.3%** | 0.3081 | — | — |
+| `coconut-oil-spec-scanned` | 7 | classification only | | | |
+
+Read the `eurlex` row carefully, because it is the reason this corpus exists.
+The extractor retains 90% of characters and **100% of the numeric residue
+values**, while **zero** of the 116 commodity codes that actually carry values
+still carry the right ones. The data is not missing — it is *dissociated*.
+Every MRL number is present; none is attributable to its commodity.
 
 Character-level metrics rate that document healthy. It is unusable, and worse
 than useless: an agent reading it pairs the wrong limit with the wrong food and
 has no signal that anything went wrong. `score.py` prints a warning whenever it
 sees this shape (high character retention, low key integrity).
+
+`jp-additive-use-categories` is the same failure one step worse — it loses more
+than half the characters outright — and `ara-oil-supply-chain-dashboard` is the
+same failure at its most deceptive: page 1 is perfect, pages 2 onward merge
+every table on the page into one grid and pull the headings between them into
+cells.
+
+`codex` and `sg` are the load-bearing counter-examples. Both are ruled
+multi-page tables and both come out nearly intact, which is what makes the
+other three diagnosable as specific defects rather than "tables are hard".
+
+### Read `valued%`, not `exact%`
+
+`keys_exact_pct` counts every keyed row, including rows whose only cell is
+their own label. Reproducing one of those proves nothing, and on EU 396 they
+were enough to turn a total loss into a 32.8% score. `valued_keys_exact_pct`
+counts only rows that had something to lose. That is the number the gate and
+the table above use.
+
+Two related traps this corpus has already sprung on its own tooling:
+
+- `difflib.SequenceMatcher` defaults to `autojunk=True`, which treats any
+  element in more than 1% of a >200-element sequence as junk. On *character*
+  sequences that is most of the alphabet. The SDS excerpt scored 0.2317 with it
+  on and 0.9069 with it off, for the same two files.
+- Exact-match on cell tuples counted a phantom trailing empty column as
+  dissociation, reporting `tw-food-additive-standards` at 0% when every value
+  was in fact attributed to the right key. Trailing blanks are now stripped
+  before comparison; padding is a structure defect, not a dissociation one.
 
 ## Layout
 
@@ -67,6 +114,19 @@ evals/
 `known_defects` with severity, root cause, status and business impact. That is
 what makes this repeatable rather than a one-off investigation.
 
+Two manifest fields beyond scoring:
+
+- `expect` — `{"pdf_type": …, "exit_code": …}`. Checked on every run. This is
+  how a document with no text layer earns a gate, and how a document that used
+  to fail extraction outright stays fixed.
+- `scoring: "classification_only"` — no text golden; the `expect` block is the
+  whole gate. Used where a text reference could only ever score 0% and would
+  read as a permanent regression rather than a correct verdict.
+
+`run_evals.py` never runs `pdf2md` with `check=True`. A document that fails to
+extract is precisely what this corpus is for; crashing the run would hide it
+and take every later document down with it.
+
 ## The candidate pool
 
 Two tracking sheets, rebuilt by `tools/build_inventory.py` from a local mirror
@@ -79,6 +139,27 @@ of the datasource buckets:
 
 Both carry `in_golden_set` / `golden_doc_id` / `notes`, so promoting a document
 into `manifest.jsonl` is recorded in one place.
+
+### The pool is much smaller than 574
+
+Deduplicated by sha256 the 574 PDFs are **354** distinct files, and **185 of
+those 354 are 13-page `pdf-lib` slices of one document** — EU 396/2005 at
+consolidation 065.001, chunked by the ingestion pipeline. They are already
+represented by `eurlex-396-consolidated` (067.001) and are not worth further
+corpus slots; they do independently reproduce its table-collapse defect.
+
+That leaves ~169 genuinely distinct documents. Profiling all 574 with
+`detect-pdf --analyze` takes about 9 seconds:
+
+| | count |
+|---|---|
+| text-based | 549 |
+| image-based / scanned / mixed | 23 |
+| failed to parse at all | 2 (same file twice — now fixed) |
+| ≤20 pages | 462 |
+
+The ≤20-page majority is what makes self-authored goldens practical; see
+"Adding a document".
 
 Mirror the originals with `gcloud storage rsync` (not a web scraper — these are
 the exact bytes we ingested, with no dead links):
@@ -144,9 +225,34 @@ Then generate the golden:
 Goldens are **frozen once generated**. Regenerating is a deliberate, reviewed
 event — a reference that changes when you rerun it is not a reference.
 
+Write the golden *before* looking at the candidate. It is the one rule that
+makes the reference independent, and it is cheap to break by accident.
+
+Size the excerpt to what you will actually transcribe. Ten of these documents
+started as 6-page samples and five were re-cut to a single 3-page run once it
+was clear a 6-page hand-transcription of a dense table would be rushed. A
+smaller golden you trust beats a larger one you don't — and the golden must
+cover the *whole* excerpt, or `raw_chars_retained_pct` becomes meaningless.
+
+Set a `gate` from the observed score, a little below it, so the document
+catches regressions without failing on noise. Add `expect` for anything the
+score cannot see: `pdf_type`, and `exit_code` for documents that must keep
+extracting at all.
+
 ## Caveat that matters
 
-`human_reviewed` is `false` on every golden here. Gemini hallucinates cells in
-dense tables. The EU 396 finding is corroborated by cell-level inspection, but
-before anyone acts on an aggregate, spot-check pages 01, 10 and 12 against the
-renders (regenerate with `pdftoppm -jpeg -r 200 evals/pdfs/<id>.pdf page`).
+`human_reviewed` is `false` on every golden here — the batch-generated ones
+because Gemini hallucinates cells in dense tables, the agent-authored ones
+because a model transcribing 50 pages of page images will drop a cell
+somewhere. Both need a human before anyone acts on an aggregate.
+
+Spot-check against the renders before trusting a number
+(`pdftoppm -jpeg -r 150 evals/pdfs/<id>.pdf page`). The EU 396 finding is
+corroborated by cell-level inspection; for the new documents, the defects with
+quoted `evidence` in `manifest.jsonl` were each read off the output directly,
+but the aggregate percentages have not been audited.
+
+Where a score needs interpretation, the manifest says so in `notes` —
+`tw-food-additive-standards` posts 12.5% valued-key accuracy and trips the
+dissociation warning, but its values are correctly attributed and the misses
+are a hyphen-rejoin defect. Read the diff before believing the metric.

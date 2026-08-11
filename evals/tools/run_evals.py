@@ -29,6 +29,7 @@ EVALS = ROOT / "evals"
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--pdf2md", type=Path, default=ROOT / "target/release/pdf2md")
+    ap.add_argument("--detect-pdf", type=Path, default=ROOT / "target/release/detect-pdf")
     ap.add_argument("--doc", help="run a single document id")
     ap.add_argument("--keep", action="store_true",
                     help="keep generated candidate markdown for inspection")
@@ -54,13 +55,42 @@ def main() -> int:
     for doc in docs:
         did = doc["id"]
         pdf = EVALS / doc["pdf"]
-        golden = EVALS / doc["golden"]
         cand = out_dir / f"{did}.md"
 
+        # Never `check=True` here. A document that fails to extract is exactly
+        # what this corpus exists to catch — crashing the run with a traceback
+        # would hide it and take every later document down with it. pdf2md
+        # exits 2 on "this PDF needs OCR", which is a verdict, not a crash.
         with cand.open("w") as fh:
-            subprocess.run([str(args.pdf2md), str(pdf)], stdout=fh,
-                           stderr=subprocess.DEVNULL, check=True)
+            rc = subprocess.run([str(args.pdf2md), str(pdf)], stdout=fh,
+                                stderr=subprocess.DEVNULL, check=False).returncode
 
+        expect = doc.get("expect") or {}
+        if expect.get("pdf_type"):
+            det = subprocess.run([str(args.detect_pdf), str(pdf), "--analyze", "--json"],
+                                 capture_output=True, check=False)
+            actual_type = (json.loads(det.stdout).get("pdf_type")
+                           if det.returncode == 0 else f"<detect-pdf exit {det.returncode}>")
+            if actual_type != expect["pdf_type"]:
+                failures.append(f"{did}: pdf_type {actual_type!r} != expected "
+                                f"{expect['pdf_type']!r}")
+        if "exit_code" in expect:
+            if rc != expect["exit_code"]:
+                failures.append(f"{did}: pdf2md exit {rc} != expected {expect['exit_code']}")
+        elif rc != 0:
+            failures.append(f"{did}: pdf2md exited {rc} (extraction failed)")
+
+        # Classification-only documents have no text layer, so there is nothing
+        # for a text golden to compare against; their gate is `expect`.
+        if doc.get("scoring") == "classification_only":
+            results.append({"id": did, "golden_pages": 0, "raw_chars_retained_pct": 0.0,
+                            "text_similarity": 0.0, "classification_only": True,
+                            "exit_code": rc})
+            if not args.keep:
+                cand.unlink(missing_ok=True)
+            continue
+
+        golden = EVALS / doc["golden"]
         cmd = [sys.executable, str(EVALS / "tools/score.py"),
                "--golden", str(golden), "--candidate", str(cand),
                "--json-output", str(out_dir / f"{did}.score.json")]
@@ -70,6 +100,7 @@ def main() -> int:
 
         score = json.loads((out_dir / f"{did}.score.json").read_text())
         score["id"] = did
+        score["exit_code"] = rc
         results.append(score)
 
         gate = doc.get("gate") or {}
@@ -83,15 +114,22 @@ def main() -> int:
         if not args.keep:
             cand.unlink(missing_ok=True)
 
-    hdr = f"{'document':<30}{'pages':>6}{'chars%':>8}{'textsim':>9}{'keys':>6}{'exact%':>8}"
+    # `valued%` — not `exact%` — is the column to read. It counts only golden
+    # rows that carry at least one value, so a document that lost every number
+    # cannot post a respectable score off rows that never had one.
+    hdr = f"{'document':<30}{'pages':>6}{'chars%':>8}{'textsim':>9}{'keys':>6}{'valued%':>8}"
     print(hdr)
     print("-" * len(hdr))
     for r in results:
-        keys = r.get("keys_in_golden", 0)
-        exact = r.get("keys_exact_pct")
+        if r.get("classification_only"):
+            print(f"{r['id']:<30}{'—':>6}{'—':>8}{'—':>9}{'—':>6}"
+                  f"{'  (classification only)':>8}")
+            continue
+        keys = r.get("valued_keys", 0)
+        valued = r.get("valued_keys_exact_pct")
         print(f"{r['id']:<30}{r['golden_pages']:>6}{r['raw_chars_retained_pct']:>8.1f}"
               f"{r['text_similarity']:>9.4f}{keys:>6}"
-              f"{('—' if exact is None else f'{exact:.1f}'):>8}")
+              f"{('—' if valued is None else f'{valued:.1f}'):>8}")
 
     if args.json_output:
         args.json_output.write_text(json.dumps(results, indent=2) + "\n")
